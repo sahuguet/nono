@@ -14,6 +14,7 @@ use crate::error::{ProxyError, Result};
 use crate::oauth2::{OAuth2ExchangeConfig, TokenCache};
 use base64::Engine;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -83,6 +84,142 @@ pub struct OAuth2Route {
     pub upstream: String,
 }
 
+/// Cached result from an `exec://` credential helper invocation.
+struct CachedExecCredential {
+    token: Zeroizing<String>,
+    expires_at: Option<std::time::SystemTime>,
+}
+
+/// Thread-safe cache for `exec://` credential helper results.
+///
+/// Calls the external binary on first use and on every refresh (when the
+/// cached token has expired or is within 30 seconds of expiry).
+pub struct ExecCache {
+    uri: String,
+    context: nono::keystore::ExecContext,
+    cache: Arc<Mutex<Option<CachedExecCredential>>>,
+}
+
+impl std::fmt::Debug for ExecCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecCache").field("uri", &self.uri).finish()
+    }
+}
+
+impl ExecCache {
+    /// Create a new cache and perform the **initial** helper invocation.
+    ///
+    /// Called during [`CredentialStore::load()`] which runs inside an async
+    /// context. We use [`tokio::task::block_in_place`] to run the blocking
+    /// subprocess call without stalling the async scheduler.
+    pub fn new(uri: String, context: nono::keystore::ExecContext) -> Result<Self> {
+        let uri_clone = uri.clone();
+        let context_clone = context.clone();
+        let (token, expires_at) = tokio::task::block_in_place(|| {
+            nono::keystore::load_exec_credential(&uri_clone, Some(&context_clone))
+        })
+        .map_err(|e| ProxyError::Credential(e.to_string()))?;
+
+        debug!(
+            "exec:// credential helper initial fetch succeeded for '{}'",
+            uri
+        );
+
+        Ok(Self {
+            uri,
+            context,
+            cache: Arc::new(Mutex::new(Some(CachedExecCredential { token, expires_at }))),
+        })
+    }
+
+    /// Return a valid token, re-invoking the helper if the cached token is
+    /// expired or absent.
+    ///
+    /// Tokens are considered expired when they are within 30 seconds of their
+    /// `expires_at` time. If the helper invocation fails, returns the stale
+    /// token (if one exists) with a warning.
+    pub async fn get_or_refresh(&self) -> Result<Zeroizing<String>> {
+        // Fast path — check if the cached token is still valid.
+        {
+            let guard = self
+                .cache
+                .lock()
+                .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
+            if let Some(ref cached) = *guard {
+                if !exec_token_is_expired(cached.expires_at) {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        // Slow path — refresh by invoking the helper again.
+        let uri = self.uri.clone();
+        let context = self.context.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            nono::keystore::load_exec_credential(&uri, Some(&context))
+        })
+        .await
+        .map_err(|e| ProxyError::Credential(format!("exec helper task failed: {}", e)))?;
+
+        match result {
+            Ok((token, expires_at)) => {
+                debug!("exec:// credential helper refreshed for '{}'", self.uri);
+                let mut guard = self
+                    .cache
+                    .lock()
+                    .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
+                *guard = Some(CachedExecCredential {
+                    token: token.clone(),
+                    expires_at,
+                });
+                Ok(token)
+            }
+            Err(e) => {
+                // On refresh failure, return the stale token if available.
+                let guard = self
+                    .cache
+                    .lock()
+                    .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
+                if let Some(ref cached) = *guard {
+                    warn!(
+                        "exec:// credential helper refresh failed (returning stale token): {}",
+                        e
+                    );
+                    Ok(cached.token.clone())
+                } else {
+                    Err(ProxyError::Credential(e.to_string()))
+                }
+            }
+        }
+    }
+}
+
+/// Returns `true` if the cached exec token is expired or about to expire.
+fn exec_token_is_expired(expires_at: Option<std::time::SystemTime>) -> bool {
+    match expires_at {
+        None => false, // No expiry — treat as permanent.
+        Some(t) => {
+            let buffer = std::time::Duration::from_secs(30);
+            std::time::SystemTime::now()
+                .checked_add(buffer)
+                .map_or(true, |now_plus_buffer| now_plus_buffer >= t)
+        }
+    }
+}
+
+/// An exec:// route entry: token cache + injection config + upstream URL.
+#[derive(Debug)]
+pub struct ExecRoute {
+    /// Cache for the dynamic credential from the external helper binary.
+    pub cache: ExecCache,
+    /// Upstream URL (e.g., "https://api.example.com")
+    pub upstream: String,
+    /// The full `LoadedCredential` used for injection (header_name, format, etc.).
+    /// The `raw_credential` and `header_value` fields are stale placeholders;
+    /// the live token is fetched from `cache` on every request.
+    pub inject_config: LoadedCredential,
+}
+
 /// Credential store for all configured routes.
 #[derive(Debug)]
 pub struct CredentialStore {
@@ -90,6 +227,8 @@ pub struct CredentialStore {
     credentials: HashMap<String, LoadedCredential>,
     /// Map from route prefix to OAuth2 route (token cache + upstream)
     oauth2_routes: HashMap<String, OAuth2Route>,
+    /// Map from route prefix to exec:// route (helper cache + upstream)
+    exec_routes: HashMap<String, ExecRoute>,
 }
 
 impl CredentialStore {
@@ -110,6 +249,7 @@ impl CredentialStore {
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
+        let mut exec_routes = HashMap::new();
 
         for route in routes {
             // Normalize prefix: strip leading/trailing slashes so it matches
@@ -117,6 +257,70 @@ impl CredentialStore {
             // the reverse proxy path (e.g., "/anthropic" -> "anthropic").
             let normalized_prefix = route.prefix.trim_matches('/').to_string();
             if let Some(ref key) = route.credential_key {
+                // exec:// credentials are dynamic — handle them via ExecCache
+                // instead of loading a static secret at startup.
+                if nono::is_exec_uri(key) {
+                    debug!(
+                        "Loading exec:// credential for route prefix: {}",
+                        normalized_prefix
+                    );
+                    let context = nono::keystore::ExecContext {
+                        service: Some(normalized_prefix.clone()),
+                        upstream: Some(route.upstream.clone()),
+                    };
+                    match ExecCache::new(key.clone(), context) {
+                        Ok(cache) => {
+                            // Build a placeholder LoadedCredential for the injection config.
+                            // The real token is fetched from cache on each request.
+                            let placeholder = Zeroizing::new(String::new());
+                            let header_value = Zeroizing::new(String::new());
+                            exec_routes.insert(
+                                normalized_prefix.clone(),
+                                ExecRoute {
+                                    cache,
+                                    upstream: route.upstream.clone(),
+                                    inject_config: LoadedCredential {
+                                        inject_mode: route.inject_mode.clone(),
+                                        proxy_inject_mode: route
+                                            .proxy
+                                            .as_ref()
+                                            .and_then(|p| p.inject_mode.clone())
+                                            .unwrap_or_else(|| route.inject_mode.clone()),
+                                        raw_credential: placeholder,
+                                        header_name: route.inject_header.clone(),
+                                        proxy_header_name: route
+                                            .proxy
+                                            .as_ref()
+                                            .and_then(|p| p.inject_header.clone())
+                                            .unwrap_or_else(|| route.inject_header.clone()),
+                                        header_value,
+                                        path_pattern: route.path_pattern.clone(),
+                                        proxy_path_pattern: route
+                                            .proxy
+                                            .as_ref()
+                                            .and_then(|p| p.path_pattern.clone())
+                                            .or_else(|| route.path_pattern.clone()),
+                                        path_replacement: route.path_replacement.clone(),
+                                        query_param_name: route.query_param_name.clone(),
+                                        proxy_query_param_name: route
+                                            .proxy
+                                            .as_ref()
+                                            .and_then(|p| p.query_param_name.clone())
+                                            .or_else(|| route.query_param_name.clone()),
+                                    },
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            debug!(
+                                "exec:// credential helper failed for route '{}': {}, skipping",
+                                normalized_prefix, e
+                            );
+                        }
+                    }
+                    continue;
+                }
+
                 debug!(
                     "Loading credential for route prefix: {} (mode: {:?})",
                     normalized_prefix, route.inject_mode
@@ -268,6 +472,7 @@ impl CredentialStore {
         Ok(Self {
             credentials,
             oauth2_routes,
+            exec_routes,
         })
     }
 
@@ -277,6 +482,7 @@ impl CredentialStore {
         Self {
             credentials: HashMap::new(),
             oauth2_routes: HashMap::new(),
+            exec_routes: HashMap::new(),
         }
     }
 
@@ -292,25 +498,32 @@ impl CredentialStore {
         self.oauth2_routes.get(prefix)
     }
 
-    /// Check if any credentials (static or OAuth2) are loaded.
+    /// Get an exec:// route (helper cache + upstream) for a route prefix, if configured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.credentials.is_empty() && self.oauth2_routes.is_empty()
+    pub fn get_exec(&self, prefix: &str) -> Option<&ExecRoute> {
+        self.exec_routes.get(prefix)
     }
 
-    /// Number of loaded credentials (static + OAuth2).
+    /// Check if any credentials (static, OAuth2, or exec) are loaded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.credentials.is_empty() && self.oauth2_routes.is_empty() && self.exec_routes.is_empty()
+    }
+
+    /// Number of loaded credentials (static + OAuth2 + exec).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.credentials.len() + self.oauth2_routes.len()
+        self.credentials.len() + self.oauth2_routes.len() + self.exec_routes.len()
     }
 
     /// Returns the set of route prefixes that have loaded credentials
-    /// (both static keystore and OAuth2 routes).
+    /// (static keystore, OAuth2, and exec routes).
     #[must_use]
     pub fn loaded_prefixes(&self) -> std::collections::HashSet<String> {
         self.credentials
             .keys()
             .chain(self.oauth2_routes.keys())
+            .chain(self.exec_routes.keys())
             .cloned()
             .collect()
     }
@@ -478,6 +691,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            exec_routes: HashMap::new(),
         };
 
         assert!(
@@ -506,6 +720,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            exec_routes: HashMap::new(),
         };
 
         let prefixes = store.loaded_prefixes();

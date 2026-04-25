@@ -89,6 +89,7 @@ pub async fn handle_reverse_proxy(
         })?;
     let static_cred = ctx.credential_store.get(&service);
     let oauth2_route = ctx.credential_store.get_oauth2(&service);
+    let exec_route = ctx.credential_store.get_exec(&service);
 
     // L7 endpoint filtering runs for all reverse-proxy routes, whether or not
     // they inject a credential.
@@ -112,6 +113,22 @@ pub async fn handle_reverse_proxy(
     if let Some(oauth2_route) = oauth2_route {
         return handle_oauth2_credential(
             oauth2_route,
+            route,
+            &service,
+            &upstream_path,
+            &method,
+            &version,
+            stream,
+            remaining_header,
+            buffered_body,
+            ctx,
+        )
+        .await;
+    }
+
+    if let Some(exec_route) = exec_route {
+        return handle_exec_credential(
+            exec_route,
             route,
             &service,
             &upstream_path,
@@ -480,6 +497,169 @@ async fn handle_oauth2_credential(
 
             write_upstream_request(&mut upstream_stream, &request, &body).await?;
             stream_response(&mut upstream_stream, stream).await?
+        }
+    };
+
+    audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, status_code);
+    Ok(())
+}
+
+/// Handle a reverse-proxy request for an `exec://` credential route.
+///
+/// Fetches (or refreshes) the token from the exec helper cache, validates the
+/// phantom session token from the client, then forwards the request to the
+/// upstream with the real credential injected as `Authorization: Bearer`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec_credential(
+    exec_route: &crate::credential::ExecRoute,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    upstream_path: &str,
+    method: &str,
+    version: &str,
+    stream: &mut TcpStream,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    ctx: &ReverseProxyCtx<'_>,
+) -> Result<()> {
+    // Fetch the current (possibly refreshed) credential from the helper.
+    let token = match exec_route.cache.get_or_refresh().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("exec:// credential helper failed for '{}': {}", service, e);
+            send_error(stream, 502, "Bad Gateway").await?;
+            return Ok(());
+        }
+    };
+
+    // Validate the phantom session token from the Authorization header.
+    if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 401, "Unauthorized").await?;
+        return Ok(());
+    }
+
+    let upstream_url = format!(
+        "{}{}",
+        exec_route.upstream.trim_end_matches('/'),
+        upstream_path
+    );
+    debug!(
+        "exec:// forwarding to upstream: {} {}",
+        method, upstream_url
+    );
+
+    let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
+        parse_upstream_url(&upstream_url)?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    let filtered_headers = filter_headers(remaining_header, "Authorization");
+    let content_length = extract_content_length(remaining_header);
+
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_authority
+    ));
+
+    request.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
+
+    for (name, value) in &filtered_headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let status_code = match upstream_scheme {
+        UpstreamScheme::Https => {
+            let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+            let mut tls_stream = match connect_upstream_tls(
+                &upstream_host,
+                upstream_port,
+                &check.resolved_addrs,
+                connector,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Upstream connection failed: {}", e);
+                    send_error(stream, 502, "Bad Gateway").await?;
+                    audit::log_denied(
+                        ctx.audit_log,
+                        audit::ProxyMode::Reverse,
+                        service,
+                        0,
+                        &e.to_string(),
+                    );
+                    return Ok(());
+                }
+            };
+            write_upstream_request(&mut tls_stream, &request, &body).await?;
+            stream_response(&mut tls_stream, stream).await?
+        }
+        UpstreamScheme::Http => {
+            let mut tcp_stream =
+                match connect_upstream_tcp(&upstream_host, upstream_port, &check.resolved_addrs)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Upstream connection failed: {}", e);
+                        send_error(stream, 502, "Bad Gateway").await?;
+                        audit::log_denied(
+                            ctx.audit_log,
+                            audit::ProxyMode::Reverse,
+                            service,
+                            0,
+                            &e.to_string(),
+                        );
+                        return Ok(());
+                    }
+                };
+            write_upstream_request(&mut tcp_stream, &request, &body).await?;
+            stream_response(&mut tcp_stream, stream).await?
         }
     };
 

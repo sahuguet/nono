@@ -60,6 +60,24 @@ const ENV_URI_PREFIX: &str = "env://";
 /// Read once at startup before sandbox activation; contents zeroed on drop.
 const FILE_URI_PREFIX: &str = "file://";
 
+/// The `exec://` URI scheme prefix, indicating an external credential helper binary.
+const EXEC_URI_PREFIX: &str = "exec://";
+
+/// Maximum byte length for an `exec://` URI.
+const EXEC_URI_MAX_LEN: usize = 4096;
+
+/// Context optionally passed to an `exec://` credential helper invocation.
+///
+/// These fields become `--service <name>` and `--upstream <url>` CLI flags
+/// passed to the helper binary alongside any query parameters from the URI.
+#[derive(Debug, Clone, Default)]
+pub struct ExecContext {
+    /// Service name passed as `--service <name>` to the helper.
+    pub service: Option<String>,
+    /// Upstream URL passed as `--upstream <url>` to the helper.
+    pub upstream: Option<String>,
+}
+
 /// Environment variable names that must never be loaded via `env://`.
 ///
 /// These control linker, interpreter, or shell behavior. Allowing them as
@@ -185,6 +203,8 @@ pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizi
         load_from_apple_password(credential_ref)
     } else if is_keyring_uri(credential_ref) {
         load_from_keyring_uri(credential_ref)
+    } else if is_exec_uri(credential_ref) {
+        load_exec_credential(credential_ref, None).map(|(token, _expiry)| token)
     } else {
         load_single_secret(service, credential_ref)
     }
@@ -1118,6 +1138,332 @@ fn apply_keyring_decode(
     }
 }
 
+/// Returns `true` if the credential reference uses the `exec://` scheme.
+#[must_use]
+pub fn is_exec_uri(credential_ref: &str) -> bool {
+    credential_ref.starts_with(EXEC_URI_PREFIX)
+}
+
+/// Validate an `exec://` URI.
+///
+/// Expected format: `exec:///absolute/path/to/binary` or
+/// `exec:///absolute/path/to/binary?key=value&key2=value2`
+///
+/// Rejects:
+/// - Non-absolute binary paths (must start with `/` after `exec://`)
+/// - Path traversal components (`..`)
+/// - Fragment identifiers
+/// - Query parameters containing shell metacharacters
+/// - URIs exceeding 4096 bytes
+pub fn validate_exec_uri(uri: &str) -> Result<()> {
+    if uri.len() > EXEC_URI_MAX_LEN {
+        return Err(NonoError::ConfigParse(format!(
+            "exec:// URI exceeds maximum length of {} bytes",
+            EXEC_URI_MAX_LEN
+        )));
+    }
+
+    let path = uri.strip_prefix(EXEC_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' does not start with '{}'",
+            uri, EXEC_URI_PREFIX
+        ))
+    })?;
+
+    if path.contains('#') {
+        return Err(NonoError::ConfigParse(format!(
+            "exec:// URI must not contain fragment identifiers: {}",
+            uri
+        )));
+    }
+
+    let (path_part, query_part) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+
+    if !path_part.starts_with('/') {
+        return Err(NonoError::ConfigParse(format!(
+            "exec:// URI must use an absolute binary path (exec:///path/to/binary), got: {}",
+            uri
+        )));
+    }
+
+    let meaningful = path_part.trim_end_matches('/');
+    if meaningful.is_empty() || meaningful == "/" {
+        return Err(NonoError::ConfigParse(format!(
+            "exec:// URI has empty binary path: {}",
+            uri
+        )));
+    }
+
+    for component in std::path::Path::new(path_part).components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(NonoError::ConfigParse(format!(
+                "exec:// URI must not contain path traversal (..): {}",
+                uri
+            )));
+        }
+    }
+
+    if let Some(query) = query_part {
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let (key, value) = param.split_once('=').ok_or_else(|| {
+                NonoError::ConfigParse(format!(
+                    "exec:// URI query parameter missing '=': '{}' in {}",
+                    param, uri
+                ))
+            })?;
+            if key.is_empty() {
+                return Err(NonoError::ConfigParse(format!(
+                    "exec:// URI has empty query parameter key in {}",
+                    uri
+                )));
+            }
+            for s in [key, value] {
+                if let Some(bad) = s.chars().find(|c| FORBIDDEN_URI_CHARS.contains(c)) {
+                    return Err(NonoError::ConfigParse(format!(
+                        "exec:// URI query parameter contains forbidden character {:?}: {}",
+                        bad, uri
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parsed components of an `exec://` URI (private).
+struct ExecUri {
+    binary: String,
+    params: Vec<(String, String)>,
+}
+
+fn parse_exec_uri(uri: &str) -> Result<ExecUri> {
+    validate_exec_uri(uri)?;
+    let path = uri
+        .strip_prefix(EXEC_URI_PREFIX)
+        .ok_or_else(|| NonoError::ConfigParse(format!("invalid exec:// URI: {}", uri)))?;
+
+    let (path_part, query_part) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+
+    let mut params = Vec::new();
+    if let Some(query) = query_part {
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = param.split_once('=') {
+                params.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+
+    Ok(ExecUri {
+        binary: path_part.to_string(),
+        params,
+    })
+}
+
+/// JSON response from an exec:// credential helper (version 1 protocol).
+#[derive(serde::Deserialize)]
+struct ExecCredentialResponse {
+    version: u32,
+    token: String,
+    expires_at: Option<String>,
+}
+
+/// Load a credential from an external `exec://` credential helper binary.
+///
+/// Invokes the binary at the URI path, passing any URI query parameters as
+/// `--key value` CLI flags, plus optional context as `--service <name>` and
+/// `--upstream <url>`. Captures stdout and parses it as JSON.
+///
+/// # JSON Protocol (version 1)
+///
+/// ```json
+/// {"version": 1, "token": "sk-...", "expires_at": "2026-04-25T15:30:00Z"}
+/// ```
+///
+/// `expires_at` is optional. When omitted the token is treated as non-expiring.
+/// `expires_at` must be an RFC 3339 UTC timestamp (`Z` suffix or `+00:00`).
+///
+/// # Returns
+///
+/// `(token, expiry)` — the credential and its optional expiry as a
+/// [`std::time::SystemTime`].
+///
+/// # Errors
+///
+/// Returns [`NonoError::ExecCredentialFailed`] if the binary is not found,
+/// exits non-zero, returns non-UTF-8 output, or produces a JSON payload
+/// that fails validation.
+pub fn load_exec_credential(
+    uri: &str,
+    context: Option<&ExecContext>,
+) -> Result<(Zeroizing<String>, Option<std::time::SystemTime>)> {
+    let parsed = parse_exec_uri(uri)?;
+
+    let mut args: Vec<String> = Vec::new();
+    for (key, value) in &parsed.params {
+        args.push(format!("--{}", key));
+        args.push(value.clone());
+    }
+    if let Some(ctx) = context {
+        if let Some(ref service) = ctx.service {
+            args.push("--service".to_string());
+            args.push(service.clone());
+        }
+        if let Some(ref upstream) = ctx.upstream {
+            args.push("--upstream".to_string());
+            args.push(upstream.clone());
+        }
+    }
+
+    tracing::debug!("Invoking exec:// credential helper: {}", parsed.binary);
+
+    let mut child = Command::new(&parsed.binary)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NonoError::ExecCredentialFailed(format!(
+                    "exec:// credential helper not found: '{}'",
+                    parsed.binary
+                ))
+            } else {
+                NonoError::ExecCredentialFailed(format!(
+                    "failed to start credential helper '{}': {}",
+                    parsed.binary, e
+                ))
+            }
+        })?;
+
+    let output = wait_with_timeout(
+        &mut child,
+        SECRET_MANAGER_TIMEOUT,
+        "exec:// credential helper",
+        "Is the helper hanging or waiting for input?",
+    )
+    .map_err(|e| {
+        let _ = child.kill();
+        let _ = child.wait();
+        e
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(NonoError::ExecCredentialFailed(format!(
+            "credential helper '{}' exited {:?}: {}",
+            parsed.binary,
+            output.status.code(),
+            stderr.trim()
+        )));
+    }
+
+    let json_str = String::from_utf8(output.stdout).map_err(|_| {
+        NonoError::ExecCredentialFailed(format!(
+            "credential helper '{}' returned non-UTF-8 output",
+            parsed.binary
+        ))
+    })?;
+
+    let response: ExecCredentialResponse = serde_json::from_str(&json_str).map_err(|e| {
+        NonoError::ExecCredentialFailed(format!(
+            "credential helper '{}' returned invalid JSON: {}",
+            parsed.binary, e
+        ))
+    })?;
+
+    if response.version != 1 {
+        return Err(NonoError::ExecCredentialFailed(format!(
+            "credential helper '{}' returned unsupported protocol version {}; expected 1",
+            parsed.binary, response.version
+        )));
+    }
+
+    if response.token.is_empty() {
+        return Err(NonoError::ExecCredentialFailed(format!(
+            "credential helper '{}' returned an empty token",
+            parsed.binary
+        )));
+    }
+
+    let expiry = response.expires_at.as_deref().and_then(parse_rfc3339_utc);
+
+    Ok((Zeroizing::new(response.token), expiry))
+}
+
+/// Parse an RFC 3339 UTC timestamp string into a [`std::time::SystemTime`].
+///
+/// Accepts `Z` or `+00:00` offsets only. Returns `None` on any parse failure;
+/// callers treat this as "no expiry" rather than a hard error.
+fn parse_rfc3339_utc(s: &str) -> Option<std::time::SystemTime> {
+    let s = s.trim();
+    // Normalise +00:00 to Z
+    let normalised;
+    let s = if let Some(stripped) = s.strip_suffix("+00:00") {
+        normalised = format!("{}Z", stripped);
+        normalised.as_str()
+    } else {
+        s
+    };
+
+    let s = s.strip_suffix('Z')?;
+    // Expected: YYYY-MM-DDTHH:MM:SS[.fraction]
+    let (date_str, time_str) = s.split_once('T')?;
+    let mut date_parts = date_str.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+
+    let mut time_parts = time_str.split(':');
+    let hour: u64 = time_parts.next()?.parse().ok()?;
+    let minute: u64 = time_parts.next()?.parse().ok()?;
+    // Seconds may include fractional part — use only the integer part.
+    let sec_field = time_parts.next()?;
+    let second: u64 = sec_field.split('.').next()?.parse().ok()?;
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None; // Before Unix epoch
+    }
+    let total_secs = days as u64 * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_secs))
+}
+
+/// Compute days since the Unix epoch (1970-01-01) from a civil (year, month, day).
+///
+/// Uses Howard Hinnant's `days_from_civil` algorithm:
+/// <http://howardhinnant.github.io/date_algorithms.html>
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Classify `op` CLI errors into actionable error messages.
 fn classify_op_error(stderr: &str, uri: &str) -> NonoError {
     let redacted = redact_op_uri(uri);
@@ -1408,6 +1754,12 @@ pub fn build_mappings_from_list(accounts: &str) -> Result<HashMap<String, String
                  Use --env-credential-map 'keyring://service/account' MY_VAR",
                 redact_keyring_uri(entry)
             )));
+        } else if is_exec_uri(entry) {
+            return Err(NonoError::ConfigParse(
+                "exec:// credential is not supported in --env-credential. \
+                 Use --env-credential-map 'exec:///path/to/helper' MY_VAR"
+                    .to_string(),
+            ));
         } else {
             // Keyring name: auto-uppercase to env var name
             let env_var = entry.to_uppercase();
@@ -1454,6 +1806,8 @@ pub fn build_mappings_from_pairs(pairs: &[(String, String)]) -> Result<HashMap<S
             validate_keyring_uri(credential_ref)?;
         } else if credential_ref.starts_with(ENV_URI_PREFIX) {
             validate_env_uri(credential_ref)?;
+        } else if is_exec_uri(credential_ref) {
+            validate_exec_uri(credential_ref)?;
         }
 
         mappings.insert(credential_ref.to_string(), env_var.to_string());

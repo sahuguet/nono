@@ -58,6 +58,9 @@ pub enum NonoError {
     #[error("Secret not found in keystore: {0}")]
     SecretNotFound(String),
 
+    #[error("Exec credential helper failed: {0}")]
+    ExecCredentialFailed(String),
+
     // Configuration errors (CLI-level but useful in library)
     #[error("Configuration parse error: {0}")]
     ConfigParse(String),
