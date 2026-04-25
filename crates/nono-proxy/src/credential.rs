@@ -14,7 +14,8 @@ use crate::error::{ProxyError, Result};
 use crate::oauth2::{OAuth2ExchangeConfig, TokenCache};
 use base64::Engine;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -141,10 +142,7 @@ impl ExecCache {
     pub async fn get_or_refresh(&self) -> Result<Zeroizing<String>> {
         // Fast path — check if the cached token is still valid.
         {
-            let guard = self
-                .cache
-                .lock()
-                .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
+            let guard = self.cache.lock().await;
             if let Some(ref cached) = *guard {
                 if !exec_token_is_expired(cached.expires_at) {
                     return Ok(cached.token.clone());
@@ -152,7 +150,16 @@ impl ExecCache {
             }
         }
 
-        // Slow path — refresh by invoking the helper again.
+        // Slow path — acquire the write lock and double-check expiry.
+        // Another task may have already refreshed while we were waiting.
+        let mut guard = self.cache.lock().await;
+        if let Some(ref cached) = *guard {
+            if !exec_token_is_expired(cached.expires_at) {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Refresh by invoking the helper in a blocking thread.
         let uri = self.uri.clone();
         let context = self.context.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -164,10 +171,6 @@ impl ExecCache {
         match result {
             Ok((token, expires_at)) => {
                 debug!("exec:// credential helper refreshed for '{}'", self.uri);
-                let mut guard = self
-                    .cache
-                    .lock()
-                    .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
                 *guard = Some(CachedExecCredential {
                     token: token.clone(),
                     expires_at,
@@ -176,10 +179,6 @@ impl ExecCache {
             }
             Err(e) => {
                 // On refresh failure, return the stale token if available.
-                let guard = self
-                    .cache
-                    .lock()
-                    .map_err(|_| ProxyError::Credential("exec cache mutex poisoned".to_string()))?;
                 if let Some(ref cached) = *guard {
                     warn!(
                         "exec:// credential helper refresh failed (returning stale token): {}",
