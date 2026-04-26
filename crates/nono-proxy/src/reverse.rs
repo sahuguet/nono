@@ -21,6 +21,7 @@ use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::route::RouteStore;
 use crate::token;
+use base64::Engine;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -522,6 +523,8 @@ async fn handle_exec_credential(
     buffered_body: &[u8],
     ctx: &ReverseProxyCtx<'_>,
 ) -> Result<()> {
+    let cred = &exec_route.inject_config;
+
     // Fetch the current (possibly refreshed) credential from the helper.
     let token = match exec_route.cache.get_or_refresh().await {
         Ok(t) => t,
@@ -532,8 +535,16 @@ async fn handle_exec_credential(
         }
     };
 
-    // Validate the phantom session token from the Authorization header.
-    if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+    // Validate the phantom session token using the configured proxy inject mode.
+    if let Err(e) = validate_phantom_token_for_mode(
+        &cred.proxy_inject_mode,
+        remaining_header,
+        upstream_path,
+        &cred.proxy_header_name,
+        cred.proxy_path_pattern.as_deref(),
+        cred.proxy_query_param_name.as_deref(),
+        ctx.session_token,
+    ) {
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -545,10 +556,27 @@ async fn handle_exec_credential(
         return Ok(());
     }
 
+    // Strip proxy artifacts from the path and apply upstream path transformation.
+    let cleaned_path = strip_proxy_artifacts(
+        upstream_path,
+        &cred.proxy_inject_mode,
+        &cred.inject_mode,
+        cred.proxy_path_pattern.as_deref(),
+        cred.proxy_query_param_name.as_deref(),
+    );
+    let transformed_path = transform_path_for_mode(
+        &cred.inject_mode,
+        &cleaned_path,
+        cred.path_pattern.as_deref(),
+        cred.path_replacement.as_deref(),
+        cred.query_param_name.as_deref(),
+        &token,
+    )?;
+
     let upstream_url = format!(
         "{}{}",
         exec_route.upstream.trim_end_matches('/'),
-        upstream_path
+        transformed_path
     );
     debug!(
         "exec:// forwarding to upstream: {} {}",
@@ -586,9 +614,22 @@ async fn handle_exec_credential(
         return Ok(());
     }
 
-    let filtered_headers = filter_headers(remaining_header, "Authorization");
-    let content_length = extract_content_length(remaining_header);
+    // Format the credential value for injection using the route's credential_format.
+    // This mirrors the logic in CredentialStore::load() for static credentials, but
+    // applied at request time with the live token.
+    let header_value = match cred.inject_mode {
+        InjectMode::Header => {
+            Zeroizing::new(exec_route.credential_format.replace("{}", token.as_str()))
+        }
+        InjectMode::BasicAuth => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+            Zeroizing::new(format!("Basic {}", encoded))
+        }
+        InjectMode::UrlPath | InjectMode::QueryParam => Zeroizing::new(String::new()),
+    };
 
+    let filtered_headers = filter_headers(remaining_header, &cred.proxy_header_name);
+    let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(body) => body,
         None => return Ok(()),
@@ -600,12 +641,32 @@ async fn handle_exec_credential(
         method, upstream_path_full, version, upstream_authority
     ));
 
-    request.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
+    // Inject the credential into the request header (Header and BasicAuth modes).
+    // UrlPath and QueryParam modes are already handled via transform_path_for_mode.
+    match cred.inject_mode {
+        InjectMode::Header | InjectMode::BasicAuth => {
+            request.push_str(&format!(
+                "{}: {}\r\n",
+                cred.header_name,
+                header_value.as_str()
+            ));
+        }
+        InjectMode::UrlPath | InjectMode::QueryParam => {}
+    }
 
+    // Forward remaining headers, skipping the upstream credential header to
+    // avoid forwarding a stale or client-supplied value.
+    let header_name_lower = cred.header_name.to_lowercase();
     for (name, value) in &filtered_headers {
+        if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+            && name.to_lowercase() == header_name_lower
+        {
+            continue;
+        }
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
 
+    request.push_str("Connection: close\r\n");
     if !body.is_empty() {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }

@@ -213,10 +213,14 @@ pub struct ExecRoute {
     pub cache: ExecCache,
     /// Upstream URL (e.g., "https://api.example.com")
     pub upstream: String,
-    /// The full `LoadedCredential` used for injection (header_name, format, etc.).
-    /// The `raw_credential` and `header_value` fields are stale placeholders;
-    /// the live token is fetched from `cache` on every request.
+    /// Injection config (mode, header name, path/query patterns).
+    /// The `raw_credential` and `header_value` fields are empty placeholders —
+    /// the live token is fetched from `cache` on every request and formatted
+    /// using `credential_format` before injection.
     pub inject_config: LoadedCredential,
+    /// Format string for the credential value (e.g., `"Bearer {}"`, `"{}"`).
+    /// `{}` is replaced with the live token on each request.
+    pub credential_format: String,
 }
 
 /// Credential store for all configured routes.
@@ -270,7 +274,9 @@ impl CredentialStore {
                     match ExecCache::new(key.clone(), context) {
                         Ok(cache) => {
                             // Build a placeholder LoadedCredential for the injection config.
-                            // The real token is fetched from cache on each request.
+                            // raw_credential and header_value are empty — the live token is
+                            // fetched from the cache on each request and formatted using
+                            // credential_format at injection time.
                             let placeholder = Zeroizing::new(String::new());
                             let header_value = Zeroizing::new(String::new());
                             exec_routes.insert(
@@ -278,6 +284,7 @@ impl CredentialStore {
                                 ExecRoute {
                                     cache,
                                     upstream: route.upstream.clone(),
+                                    credential_format: route.credential_format.clone(),
                                     inject_config: LoadedCredential {
                                         inject_mode: route.inject_mode.clone(),
                                         proxy_inject_mode: route
