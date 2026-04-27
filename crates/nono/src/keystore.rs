@@ -3252,4 +3252,203 @@ mod tests {
         let result = build_mappings_from_list("file:///run/secrets/api-token");
         assert!(result.is_err());
     }
+
+    // --- is_exec_uri ---
+
+    #[test]
+    fn test_is_exec_uri_true() {
+        assert!(is_exec_uri("exec:///usr/local/bin/helper"));
+        assert!(is_exec_uri("exec:///path/to/helper?env=prod"));
+    }
+
+    #[test]
+    fn test_is_exec_uri_false() {
+        assert!(!is_exec_uri("op://vault/item/field"));
+        assert!(!is_exec_uri("env://MY_VAR"));
+        assert!(!is_exec_uri("keyring://service/account"));
+        assert!(!is_exec_uri("/usr/local/bin/helper"));
+        assert!(!is_exec_uri(""));
+    }
+
+    // --- validate_exec_uri ---
+
+    #[test]
+    fn test_validate_exec_uri_valid_no_params() {
+        assert!(validate_exec_uri("exec:///usr/local/bin/my-helper").is_ok());
+    }
+
+    #[test]
+    fn test_validate_exec_uri_valid_with_params() {
+        assert!(validate_exec_uri("exec:///usr/local/bin/helper?env=prod&role=reader").is_ok());
+    }
+
+    #[test]
+    fn test_validate_exec_uri_missing_prefix() {
+        let err = validate_exec_uri("/usr/local/bin/helper").expect_err("should reject");
+        assert!(err.to_string().contains("does not start with"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_relative_path() {
+        let err =
+            validate_exec_uri("exec://relative/path").expect_err("should reject relative path");
+        assert!(err.to_string().contains("absolute"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_empty_path() {
+        let err = validate_exec_uri("exec:///").expect_err("should reject empty path");
+        assert!(err.to_string().contains("empty"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_path_traversal() {
+        let err = validate_exec_uri("exec:///usr/../etc/passwd")
+            .expect_err("should reject path traversal");
+        assert!(err.to_string().contains("traversal"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_fragment_rejected() {
+        let err = validate_exec_uri("exec:///usr/bin/helper#fragment").expect_err("should reject");
+        assert!(err.to_string().contains("fragment"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_forbidden_char_in_param() {
+        let err = validate_exec_uri("exec:///usr/bin/helper?key=val;bad")
+            .expect_err("should reject semicolon");
+        assert!(err.to_string().contains("forbidden character"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_param_missing_equals() {
+        let err = validate_exec_uri("exec:///usr/bin/helper?badparam").expect_err("should reject");
+        assert!(err.to_string().contains("missing '='"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_uri_empty_param_key() {
+        let err = validate_exec_uri("exec:///usr/bin/helper?=value").expect_err("should reject");
+        assert!(
+            err.to_string().contains("empty query parameter key"),
+            "{}",
+            err
+        );
+    }
+
+    // --- parse_rfc3339_utc ---
+
+    #[test]
+    fn test_parse_rfc3339_utc_z_suffix() {
+        let t = parse_rfc3339_utc("2026-04-25T15:30:00Z").expect("should parse");
+        // 2026-04-25 = days since epoch: verify by computing expected seconds
+        let days = days_from_civil(2026, 4, 25);
+        let expected_secs = days as u64 * 86_400 + 15 * 3_600 + 30 * 60;
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(expected_secs);
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_plus_zero_offset() {
+        // +00:00 should be treated identically to Z
+        let t_z = parse_rfc3339_utc("2026-04-25T15:30:00Z");
+        let t_plus = parse_rfc3339_utc("2026-04-25T15:30:00+00:00");
+        assert_eq!(t_z, t_plus);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_with_fractional_seconds() {
+        // Fractional seconds should be ignored (truncated to integer)
+        let t = parse_rfc3339_utc("2026-04-25T15:30:00.123Z");
+        assert!(t.is_some());
+        let t_no_frac = parse_rfc3339_utc("2026-04-25T15:30:00Z");
+        assert_eq!(t, t_no_frac);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_unix_epoch() {
+        let t = parse_rfc3339_utc("1970-01-01T00:00:00Z").expect("should parse epoch");
+        assert_eq!(t, std::time::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_non_utc_offset_rejected() {
+        // Non-UTC offset should return None
+        assert!(parse_rfc3339_utc("2026-04-25T15:30:00+05:00").is_none());
+        assert!(parse_rfc3339_utc("2026-04-25T15:30:00-07:00").is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_invalid_date() {
+        assert!(parse_rfc3339_utc("not-a-date").is_none());
+        assert!(parse_rfc3339_utc("2026-13-01T00:00:00Z").is_none()); // month 13
+        assert!(parse_rfc3339_utc("2026-04-32T00:00:00Z").is_none()); // day 32
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_invalid_time() {
+        assert!(parse_rfc3339_utc("2026-04-25T25:00:00Z").is_none()); // hour 25
+        assert!(parse_rfc3339_utc("2026-04-25T00:61:00Z").is_none()); // minute 61
+    }
+
+    // --- days_from_civil ---
+
+    #[test]
+    fn test_days_from_civil_epoch() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn test_days_from_civil_known_dates() {
+        // 2000-01-01 = 10957 days after epoch
+        assert_eq!(days_from_civil(2000, 1, 1), 10957);
+        // 2024-02-29 (leap day) = 19782 days after epoch
+        assert_eq!(days_from_civil(2024, 2, 29), 19782);
+    }
+
+    // --- exec:// in build_mappings_from_list ---
+
+    #[test]
+    fn test_build_mappings_exec_uri_rejected_in_list_mode() {
+        let err = build_mappings_from_list("exec:///usr/local/bin/helper")
+            .expect_err("should reject exec:// in list mode");
+        assert!(err.to_string().contains("--env-credential-map"), "{}", err);
+    }
+
+    // --- exec:// in build_mappings_from_pairs ---
+
+    #[test]
+    fn test_build_mappings_from_pairs_exec_uri_valid() {
+        let pairs = vec![(
+            "exec:///usr/local/bin/helper".to_string(),
+            "MY_TOKEN".to_string(),
+        )];
+        let mappings = build_mappings_from_pairs(&pairs).expect("should accept valid exec:// URI");
+        assert_eq!(
+            mappings.get("exec:///usr/local/bin/helper"),
+            Some(&"MY_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_from_pairs_exec_uri_with_params() {
+        let pairs = vec![(
+            "exec:///usr/local/bin/helper?env=prod".to_string(),
+            "API_TOKEN".to_string(),
+        )];
+        let mappings =
+            build_mappings_from_pairs(&pairs).expect("should accept exec:// with params");
+        assert_eq!(
+            mappings.get("exec:///usr/local/bin/helper?env=prod"),
+            Some(&"API_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_from_pairs_exec_uri_invalid_rejected() {
+        let pairs = vec![("exec://relative/path".to_string(), "MY_TOKEN".to_string())];
+        let err = build_mappings_from_pairs(&pairs).expect_err("should reject invalid exec:// URI");
+        assert!(err.to_string().contains("absolute"), "{}", err);
+    }
 }

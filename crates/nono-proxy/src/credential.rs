@@ -799,4 +799,98 @@ mod tests {
 
         TokenCache::new_from_parts(config, test_tls_connector(), token, ttl)
     }
+
+    // ── exec_token_is_expired ─────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_token_no_expiry_is_not_expired() {
+        assert!(!exec_token_is_expired(None));
+    }
+
+    #[test]
+    fn test_exec_token_far_future_is_not_expired() {
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(!exec_token_is_expired(Some(future)));
+    }
+
+    #[test]
+    fn test_exec_token_expired_in_past() {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert!(exec_token_is_expired(Some(past)));
+    }
+
+    #[test]
+    fn test_exec_token_expiring_within_buffer_is_expired() {
+        // 10s from now is within the 30-second buffer.
+        let near_future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        assert!(exec_token_is_expired(Some(near_future)));
+    }
+
+    #[test]
+    fn test_exec_token_expiring_just_outside_buffer_is_not_expired() {
+        // 60s from now is safely outside the 30-second buffer.
+        let safe_future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(!exec_token_is_expired(Some(safe_future)));
+    }
+
+    // ── ExecCache ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_exec_cache_returns_permanent_token() {
+        let cached = CachedExecCredential {
+            token: Zeroizing::new("test-token".to_string()),
+            expires_at: None,
+        };
+        let cache = ExecCache {
+            uri: "exec:///bin/true".to_string(),
+            context: nono::ExecContext::default(),
+            cache: Arc::new(tokio::sync::Mutex::new(Some(cached))),
+        };
+
+        let result = cache.get_or_refresh().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "test-token");
+    }
+
+    #[tokio::test]
+    async fn test_exec_cache_returns_non_expired_token() {
+        let cached = CachedExecCredential {
+            token: Zeroizing::new("fresh-token".to_string()),
+            expires_at: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
+        };
+        let cache = ExecCache {
+            uri: "exec:///bin/true".to_string(),
+            context: nono::ExecContext::default(),
+            cache: Arc::new(tokio::sync::Mutex::new(Some(cached))),
+        };
+
+        let result = cache.get_or_refresh().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn test_exec_cache_refresh_fails_for_missing_binary() {
+        let cache = ExecCache {
+            uri: "exec:///nonexistent/binary/that/does/not/exist".to_string(),
+            context: nono::ExecContext::default(),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = cache.get_or_refresh().await;
+        assert!(result.is_err(), "expected error for missing binary");
+    }
+
+    #[tokio::test]
+    async fn test_exec_cache_refresh_fails_for_nonzero_exit() {
+        // /bin/false exits 1, producing no JSON — should fail.
+        let cache = ExecCache {
+            uri: "exec:///bin/false".to_string(),
+            context: nono::ExecContext::default(),
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = cache.get_or_refresh().await;
+        assert!(result.is_err(), "expected error for non-zero exit");
+    }
 }
